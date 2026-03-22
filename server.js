@@ -1,111 +1,107 @@
 const express = require('express');
 const https = require('https');
-const { URL } = require('url');
 
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// Raw body voor form-urlencoded doorsturen
+// Parse raw body voor ALLE requests
 app.use((req, res, next) => {
-  if (req.headers['content-type'] === 'application/x-www-form-urlencoded') {
-    let data = '';
-    req.setEncoding('utf8');
-    req.on('data', chunk => data += chunk);
-    req.on('end', () => {
-      req.rawBody = data;
-      next();
-    });
-  } else {
+  let data = '';
+  req.setEncoding('utf8');
+  req.on('data', chunk => data += chunk);
+  req.on('end', () => {
+    req.rawBody = data;
     next();
-  }
+  });
 });
 
 const PROXY_SECRET = process.env.PROXY_SECRET;
-const PONTO_CERT = process.env.PONTO_CERT;
-const PONTO_KEY = process.env.PONTO_KEY;
 
-const IBANITY_HOST = 'api.ibanity.com';
+// Fix newlines in PEM (Railway kan \n als literal string opslaan)
+function fixPem(pem) {
+  if (!pem) return '';
+  return pem.replace(/\\n/g, '\n');
+}
+
+const PONTO_CERT = fixPem(process.env.PONTO_CERT);
+const PONTO_KEY = fixPem(process.env.PONTO_KEY);
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', certLoaded: !!PONTO_CERT, keyLoaded: !!PONTO_KEY });
+  res.json({
+    status: 'ok',
+    certLoaded: PONTO_CERT.includes('BEGIN CERTIFICATE'),
+    keyLoaded: PONTO_KEY.includes('BEGIN'),
+    certLength: PONTO_CERT.length,
+    keyLength: PONTO_KEY.length,
+  });
 });
 
-// Proxy alle requests naar Ibanity
-app.all('/proxy/*', async (req, res) => {
-  // Verificatie: alleen jouw edge functions mogen deze proxy gebruiken
-  const authHeader = req.headers['x-proxy-secret'];
-  if (authHeader !== PROXY_SECRET) {
+// Proxy
+app.all('/proxy/*', (req, res) => {
+  if (req.headers['x-proxy-secret'] !== PROXY_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // Bouw het Ibanity pad op
-  const ibanityPath = req.params[0]; // alles na /proxy/
-  const targetUrl = `https://${IBANITY_HOST}/${ibanityPath}`;
+  const path = '/' + req.params[0];
+  console.log(`[PROXY] ${req.method} ${path}`);
 
-  try {
-    const url = new URL(targetUrl);
+  const options = {
+    hostname: 'api.ibanity.com',
+    port: 443,
+    path: path,
+    method: req.method,
+    headers: {},
+    cert: PONTO_CERT,
+    key: PONTO_KEY,
+    timeout: 30000,
+  };
 
-    // Bouw headers (forward relevante headers)
-    const headers = {};
-    if (req.headers['authorization']) headers['Authorization'] = req.headers['authorization'];
-    if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type'];
-    headers['Accept'] = req.headers['accept'] || 'application/json';
+  // Forward relevante headers
+  if (req.headers['authorization']) options.headers['Authorization'] = req.headers['authorization'];
+  if (req.headers['content-type']) options.headers['Content-Type'] = req.headers['content-type'];
+  options.headers['Accept'] = 'application/json';
 
-    // Bepaal body
-    let body = null;
-    if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
-      if (req.rawBody) {
-        body = req.rawBody;
-      } else if (req.body && Object.keys(req.body).length > 0) {
-        body = JSON.stringify(req.body);
-      }
-    }
-
-    const options = {
-      hostname: url.hostname,
-      port: 443,
-      path: url.pathname + url.search,
-      method: req.method,
-      headers: headers,
-      cert: PONTO_CERT,
-      key: PONTO_KEY,
-      // Belangrijk: dit zijn de mTLS opties
-    };
-
-    const proxyReq = https.request(options, (proxyRes) => {
-      let data = '';
-      proxyRes.on('data', chunk => data += chunk);
-      proxyRes.on('end', () => {
-        res.status(proxyRes.statusCode);
-        // Forward content-type
-        if (proxyRes.headers['content-type']) {
-          res.setHeader('Content-Type', proxyRes.headers['content-type']);
-        }
-        res.send(data);
-      });
-    });
-
-    proxyReq.on('error', (err) => {
-      console.error('Proxy request error:', err.message);
-      res.status(502).json({ error: 'Proxy request failed', details: err.message });
-    });
-
-    if (body) {
-      proxyReq.write(body);
-    }
-    proxyReq.end();
-
-  } catch (err) {
-    console.error('Proxy error:', err.message);
-    res.status(500).json({ error: 'Internal proxy error', details: err.message });
+  // Content-Length meegeven als er een body is
+  if (req.rawBody && req.rawBody.length > 0) {
+    options.headers['Content-Length'] = Buffer.byteLength(req.rawBody);
   }
+
+  const proxyReq = https.request(options, (proxyRes) => {
+    let body = '';
+    proxyRes.on('data', chunk => body += chunk);
+    proxyRes.on('end', () => {
+      console.log(`[PROXY] Response: ${proxyRes.statusCode} (${body.length} bytes)`);
+      res.status(proxyRes.statusCode);
+      if (proxyRes.headers['content-type']) {
+        res.setHeader('Content-Type', proxyRes.headers['content-type']);
+      }
+      res.send(body);
+    });
+  });
+
+  proxyReq.on('timeout', () => {
+    console.log('[PROXY] Request timeout!');
+    proxyReq.destroy();
+    res.status(504).json({ error: 'Gateway timeout' });
+  });
+
+  proxyReq.on('error', (err) => {
+    console.log('[PROXY] Error:', err.message);
+    console.log('[PROXY] Error code:', err.code);
+    res.status(502).json({ error: err.message, code: err.code });
+  });
+
+  if (req.rawBody && req.rawBody.length > 0) {
+    proxyReq.write(req.rawBody);
+  }
+  proxyReq.end();
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Ponto proxy running on port ${PORT}`);
-  console.log(`Certificate loaded: ${!!PONTO_CERT} (${PONTO_CERT?.length || 0} chars)`);
-  console.log(`Private key loaded: ${!!PONTO_KEY} (${PONTO_KEY?.length || 0} chars)`);
+  console.log(`Certificate valid: ${PONTO_CERT.includes('BEGIN CERTIFICATE')}`);
+  console.log(`Key valid: ${PONTO_KEY.includes('BEGIN')}`);
+  console.log(`Cert length: ${PONTO_CERT.length}`);
+  console.log(`Key length: ${PONTO_KEY.length}`);
 });
